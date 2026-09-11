@@ -114,7 +114,9 @@ def _make_worker(model_runner: object) -> MetalWorker:
         memory_fraction=AUTO_MEMORY_FRACTION,
         mlx_device="gpu",
     )
-    worker.cache_config = SimpleNamespace(block_size=16, gpu_memory_utilization=0.92)
+    worker.cache_config = SimpleNamespace(
+        block_size=16, gpu_memory_utilization=0.92, kv_cache_memory_bytes=None
+    )
     worker.vllm_config = SimpleNamespace(cache_config=worker.cache_config)
     return worker
 
@@ -391,6 +393,98 @@ class TestPagedAttentionPlanDiagnostics:
         assert "kv_budget_before_hybrid" not in message
         assert "--max-num-seqs" not in message
         assert "kv_budget=-1.10GB" in message
+
+    @pytest.mark.parametrize("draft_scratch_bytes", [0, 500_000_000])
+    def test_kv_cache_memory_bytes_replaces_fraction_budget(
+        self, monkeypatch, draft_scratch_bytes: int
+    ) -> None:
+        """``--kv-cache-memory-bytes`` sets the budget; the fraction is ignored.
+
+        The same 0.1 fraction leaves no room for KV cache in the OOM test above.
+        Reservations are still carved out of the explicit size.
+        """
+        runner = SimpleNamespace(
+            is_hybrid=False,
+            draft_scratch_reserve_bytes=MagicMock(return_value=draft_scratch_bytes),
+        )
+        planner = self._make_planner(
+            runner, memory_fraction=0.1, per_block_bytes=1_000_000
+        )
+        planner._worker.cache_config.kv_cache_memory_bytes = 4_000_000_000
+        monkeypatch.setattr(
+            WorkerCachePlanner,
+            "_metal_limit_bytes",
+            lambda self: 10_000_000_000,
+        )
+        monkeypatch.setattr(
+            WorkerCachePlanner,
+            "get_model_memory_usage",
+            lambda self: 2_000_000_000,
+        )
+
+        plan = planner._paged_attention_plan(overhead=100_000_000)
+
+        assert plan.base_kv_budget == 4_000_000_000
+        assert plan.kv_budget == 4_000_000_000 - draft_scratch_bytes
+        assert plan.num_blocks == plan.kv_budget // 1_000_000
+        breakdown = plan.format_breakdown()
+        assert "kv_cache_memory_bytes=4.00GB" in breakdown
+        assert "fraction=" not in breakdown
+
+    def test_kv_cache_memory_bytes_beyond_metal_memory_is_rejected(
+        self, monkeypatch
+    ) -> None:
+        runner = SimpleNamespace(
+            is_hybrid=False,
+            draft_scratch_reserve_bytes=MagicMock(return_value=0),
+        )
+        planner = self._make_planner(runner, memory_fraction=0.9)
+        planner._worker.cache_config.kv_cache_memory_bytes = 8_000_000_000
+        monkeypatch.setattr(
+            WorkerCachePlanner,
+            "_metal_limit_bytes",
+            lambda self: 10_000_000_000,
+        )
+        monkeypatch.setattr(
+            WorkerCachePlanner,
+            "get_model_memory_usage",
+            lambda self: 2_000_000_000,
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=re.escape("--kv-cache-memory-bytes=8.00GB exceeds the 7.90GB"),
+        ):
+            planner._paged_attention_plan(overhead=100_000_000)
+
+    def test_kv_cache_memory_bytes_too_small_points_at_the_flag(
+        self, monkeypatch
+    ) -> None:
+        runner = SimpleNamespace(
+            is_hybrid=False,
+            draft_scratch_reserve_bytes=MagicMock(return_value=0),
+        )
+        planner = self._make_planner(
+            runner, memory_fraction=0.9, per_block_bytes=1_000_000
+        )
+        planner._worker.cache_config.kv_cache_memory_bytes = 1_000_000
+        monkeypatch.setattr(
+            WorkerCachePlanner,
+            "_metal_limit_bytes",
+            lambda self: 10_000_000_000,
+        )
+        monkeypatch.setattr(
+            WorkerCachePlanner,
+            "get_model_memory_usage",
+            lambda self: 2_000_000_000,
+        )
+
+        with pytest.raises(ValueError, match="num_blocks too low") as exc_info:
+            planner._paged_attention_plan(overhead=100_000_000)
+
+        message = str(exc_info.value)
+        assert "increase --kv-cache-memory-bytes" in message
+        assert "VLLM_METAL_MEMORY_FRACTION" not in message
 
     @pytest.mark.parametrize(
         "is_auto, memory_fraction, gpu_mem_util, expected_fraction",

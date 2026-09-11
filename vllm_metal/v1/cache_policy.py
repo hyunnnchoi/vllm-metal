@@ -226,12 +226,20 @@ class _PagedAttentionPlan:
     hybrid_gdn_reservation: _HybridGDNReservation
     kv_budget: int
     num_blocks: int
+    kv_cache_memory_bytes: int | None = None
 
     def format_breakdown(self) -> str:
-        parts = [
-            f"metal_limit={self.metal_limit / 1e9:.2f}GB",
-            f"fraction={self.fraction}",
-            f"usable_metal={self.usable_metal / 1e9:.2f}GB",
+        parts = [f"metal_limit={self.metal_limit / 1e9:.2f}GB"]
+        if self.kv_cache_memory_bytes is None:
+            parts += [
+                f"fraction={self.fraction}",
+                f"usable_metal={self.usable_metal / 1e9:.2f}GB",
+            ]
+        else:
+            parts.append(
+                f"kv_cache_memory_bytes={self.kv_cache_memory_bytes / 1e9:.2f}GB"
+            )
+        parts += [
             f"model_memory={self.model_memory / 1e9:.2f}GB",
             f"overhead={self.overhead / 1e9:.2f}GB",
         ]
@@ -244,7 +252,9 @@ class _PagedAttentionPlan:
 
     def format_mitigations(self) -> str:
         mitigations = [
-            "increase VLLM_METAL_MEMORY_FRACTION",
+            "increase VLLM_METAL_MEMORY_FRACTION"
+            if self.kv_cache_memory_bytes is None
+            else "increase --kv-cache-memory-bytes",
             "use a smaller or more quantized model",
         ]
         reservation = self.hybrid_gdn_reservation
@@ -1190,11 +1200,48 @@ class WorkerCachePlanner:
         """Return Metal-memory budget before hybrid GDN reservation."""
         return int(metal_limit * fraction) - model_memory - overhead
 
+    @staticmethod
+    def _explicit_kv_budget_bytes(
+        kv_cache_memory_bytes: int,
+        *,
+        metal_limit: int,
+        model_memory: int,
+        overhead: int,
+    ) -> int:
+        """Return ``--kv-cache-memory-bytes`` as the budget before reservations.
+
+        Upstream GPU and CPU workers use the explicit size as the KV cache
+        budget and skip ``--gpu-memory-utilization``; Metal follows suit and
+        also skips ``VLLM_METAL_MEMORY_FRACTION``. Hybrid GDN state and draft
+        scratch are still carved out of it, so every Metal KV pool stays within
+        the requested size. The size must fit in the working set left after the
+        weights and the profiled activation overhead.
+        """
+        available = metal_limit - model_memory - overhead
+        if kv_cache_memory_bytes > available:
+            raise ValueError(
+                "Paged attention: --kv-cache-memory-bytes="
+                f"{kv_cache_memory_bytes / 1e9:.2f}GB exceeds the "
+                f"{available / 1e9:.2f}GB of Metal memory left for KV cache "
+                f"(metal_limit={metal_limit / 1e9:.2f}GB, "
+                f"model_memory={model_memory / 1e9:.2f}GB, "
+                f"overhead={overhead / 1e9:.2f}GB). "
+                "Lower --kv-cache-memory-bytes."
+            )
+        logger.info(
+            "Paged attention: using --kv-cache-memory-bytes=%.2f GB; "
+            "--gpu-memory-utilization and VLLM_METAL_MEMORY_FRACTION are ignored",
+            kv_cache_memory_bytes / 1e9,
+        )
+        return kv_cache_memory_bytes
+
     def _paged_attention_plan(
         self, *, overhead: int, require_min_blocks: bool = True
     ) -> _PagedAttentionPlan:
-        block_size = self._worker.vllm_config.cache_config.block_size
-        fraction = self._memory_fraction()
+        cache_config = self._worker.vllm_config.cache_config
+        block_size = cache_config.block_size
+        # Upstream workers treat 0 as unset (``if kv_cache_memory_bytes := ...``).
+        kv_cache_memory_bytes = cache_config.kv_cache_memory_bytes or None
         metal_limit = self._metal_limit_bytes()
         model_memory = self.get_model_memory_usage()
         per_block_bytes = self._worker.get_cache_block_size_bytes()
@@ -1206,13 +1253,24 @@ class WorkerCachePlanner:
         # replacement materializes, so budget that one-pool overlap too.
         per_block_bytes += self._hybrid_align_state_bytes_per_block()
         per_block_bytes += self._hybrid_align_growth_bytes_per_block()
-        usable_metal = int(metal_limit * fraction)
-        base_kv_budget = self.base_kv_budget_bytes(
-            metal_limit,
-            model_memory,
-            fraction,
-            overhead,
-        )
+        if kv_cache_memory_bytes is None:
+            fraction = self._memory_fraction()
+            usable_metal = int(metal_limit * fraction)
+            base_kv_budget = self.base_kv_budget_bytes(
+                metal_limit,
+                model_memory,
+                fraction,
+                overhead,
+            )
+        else:
+            fraction = 1.0
+            usable_metal = metal_limit
+            base_kv_budget = self._explicit_kv_budget_bytes(
+                kv_cache_memory_bytes,
+                metal_limit=metal_limit,
+                model_memory=model_memory,
+                overhead=overhead,
+            )
         reservation = self._hybrid_gdn_reservation()
         draft_scratch_bytes = self._worker.model_runner.draft_scratch_reserve_bytes()
         kv_budget = base_kv_budget - reservation.total_bytes - draft_scratch_bytes
@@ -1228,6 +1286,7 @@ class WorkerCachePlanner:
             hybrid_gdn_reservation=reservation,
             kv_budget=kv_budget,
             num_blocks=max(0, kv_budget // per_block_bytes),
+            kv_cache_memory_bytes=kv_cache_memory_bytes,
         )
         self._validate_paged_attention_plan(
             plan,
