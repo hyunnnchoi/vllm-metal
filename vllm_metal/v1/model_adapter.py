@@ -763,8 +763,12 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         Explicit ``layer_types`` identify sliding and full layers directly.
         mlx-lm filters that field out of EXAONE's ``ModelArgs``, so for EXAONE
         derive the same cyclic layout its model constructor uses from the
-        retained ``sliding_window_pattern``. Full-attention layers use ``-1``.
-        Models without either authoritative layout or ``sliding_window`` return
+        retained ``sliding_window_pattern``. Gemma 3 and Cohere2 carry no
+        ``layer_types`` in mlx-lm or mlx-vlm and keep an integer period
+        instead: every ``sliding_window_pattern``-th layer is full attention and
+        the rest slide, the rule both their mlx model constructors and the
+        Transformers configs apply. Full-attention layers use ``-1``.
+        Models without an authoritative layout or ``sliding_window`` return
         ``None``, keeping window enforcement disabled everywhere.
         """
         sliding_window = args.get("sliding_window")
@@ -772,12 +776,17 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
             return None
 
         layer_types = args.get("layer_types")
+        pattern = args.get("sliding_window_pattern")
         if layer_types is None and args.get("model_type") == "exaone4":
-            pattern = args.get("sliding_window_pattern")
             if isinstance(pattern, str):
                 from vllm_metal.compat import _exaone4_layer_types_from_pattern
 
                 layer_types = _exaone4_layer_types_from_pattern(pattern, num_layers)
+        elif layer_types is None and isinstance(pattern, int) and pattern > 0:
+            layer_types = [
+                "full_attention" if (i + 1) % pattern == 0 else "sliding_attention"
+                for i in range(num_layers)
+            ]
 
         if layer_types is None or len(layer_types) != num_layers:
             return None

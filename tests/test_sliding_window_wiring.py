@@ -127,6 +127,76 @@ class TestNonYocoSlidingWindowWiring:
         assert backend._cache is not None
         assert backend._cache.sliding_window_per_layer == [_NO_WINDOW] * num_layers
 
+    def test_integer_pattern_config_lands_in_kv_cache(self) -> None:
+        """An integer ``sliding_window_pattern`` expands to a periodic layout.
+
+        Cohere2 (period 4) and Gemma 3 (period 6) carry no ``layer_types`` in
+        mlx-lm or mlx-vlm; every ``pattern``-th layer is full attention.
+        """
+        # Arrange: Cohere2-like period 4 over 8 layers.
+        num_layers = 8
+        model_args = {
+            "sliding_window": _SLIDING_WINDOW,
+            "sliding_window_pattern": 4,
+            "num_hidden_layers": num_layers,
+        }
+        expected = [_SLIDING_WINDOW, _SLIDING_WINDOW, _SLIDING_WINDOW, _NO_WINDOW] * 2
+        adapter = DefaultModelAdapter()
+        sw_list = adapter.build_sliding_window_per_layer(model_args, num_layers)
+
+        runner = make_stub_runner(
+            model_args=model_args,
+            num_layers=num_layers,
+            num_kv_cache_layers=num_layers,
+            num_kv_heads=_NUM_KV_HEADS,
+            head_dim=_HEAD_DIM,
+            kv_cache_dtype=_KV_CACHE_DTYPE,
+            cache_config=SimpleNamespace(block_size=_BLOCK_SIZE),
+            sliding_window_per_layer=sw_list,
+            _yoco_cache_mapping=None,
+        )
+
+        # Act
+        backend = runner.build_paged_attention_runtime(block_size=_BLOCK_SIZE)
+        backend.initialize(num_blocks=_NUM_BLOCKS)
+
+        # Assert
+        assert backend._cache is not None
+        assert backend._cache.sliding_window_per_layer == expected
+
+    def test_mlx_lm_gemma3_args_keep_sliding_layers(self) -> None:
+        """Gemma 3 as loaded by mlx-lm still gets its sliding layers.
+
+        ``BaseModelArgs.from_dict`` drops keys the dataclass does not declare
+        and ``gemma3_text.ModelArgs`` declares no ``layer_types``, so the
+        runner only ever sees the integer period.
+        """
+        from mlx_lm.models.gemma3_text import ModelArgs
+
+        # Arrange: mlx-community/gemma-3-1b-it-qat-4bit geometry.
+        num_layers = 26
+        full_attention_layers = {5, 11, 17, 23}
+        args = vars(
+            ModelArgs.from_dict(
+                {
+                    "model_type": "gemma3_text",
+                    "num_hidden_layers": num_layers,
+                    "sliding_window": 512,
+                    "sliding_window_pattern": 6,
+                    "layer_types": ["sliding_attention"] * num_layers,
+                }
+            )
+        )
+        assert "layer_types" not in args
+
+        # Act
+        sw_list = DefaultModelAdapter().build_sliding_window_per_layer(args, num_layers)
+
+        # Assert
+        assert sw_list == [
+            _NO_WINDOW if i in full_attention_layers else 512 for i in range(num_layers)
+        ]
+
 
 # ===
 # YOCO: shared cache layers indexed via ``cache_idx_map``.
