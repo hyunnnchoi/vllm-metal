@@ -474,6 +474,19 @@ class MetalPlatform(Platform):
                 "--additional-config '{\"turboquant\": true}' instead."
             )
 
+        # vLLM accepts quantized KV cache dtypes and logs them as in use, but the
+        # Metal paged KV cache is always stored in the model dtype, so the
+        # requested memory saving would silently never happen. Half-precision
+        # names keep today's behavior; TurboQuant is Metal's quantized KV cache.
+        cache_dtype = vllm_config.cache_config.cache_dtype
+        if cache_dtype not in ("auto", "float16", "bfloat16"):
+            raise NotImplementedError(
+                f"vllm-metal does not support --kv-cache-dtype {cache_dtype}: the "
+                "paged KV cache is stored in the model dtype. Use "
+                "--kv-cache-dtype auto, or enable TurboQuant with "
+                "--additional-config '{\"turboquant\": true}'."
+            )
+
         # Upstream skips verify_equal_vocab_size_if_draft_model() when this is set,
         # so a draft model with a different vocabulary reaches the proposer, which
         # verifies draft ids against the target vocabulary with no mapping.

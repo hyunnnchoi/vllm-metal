@@ -695,6 +695,26 @@ class TestMetalPlatform:
         with pytest.raises(NotImplementedError, match="heterogeneous KV cache dtypes"):
             MetalPlatform.check_and_update_config(vllm_config)
 
+    @pytest.mark.parametrize(
+        "cache_dtype", ["fp8", "fp8_e5m2", "int8_per_token_head", "nvfp4"]
+    )
+    def test_check_and_update_config_rejects_quantized_kv_cache_dtype(
+        self, cache_dtype: str
+    ) -> None:
+        """Quantized KV dtypes are rejected rather than silently ignored.
+
+        vLLM logs the quantized dtype as in use, but Metal stores the paged KV
+        cache in the model dtype, so the memory saving would never happen.
+        """
+        vllm_config = self._dp_vllm_config()
+        vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.cache_config.cache_dtype = cache_dtype
+
+        with pytest.raises(
+            NotImplementedError, match=f"--kv-cache-dtype {cache_dtype}"
+        ):
+            MetalPlatform.check_and_update_config(vllm_config)
+
     def test_check_and_update_config_rejects_heterogeneous_draft_vocab(self) -> None:
         """A draft vocabulary that differs from the target is unsupported.
 
